@@ -1,0 +1,12 @@
+# Do not upload to App Engine
+.git
+.gitignore
+.env
+.env.*
+node_modules/
+*.log
+.idea
+.vscode
+temp/
+*.md
+!README.md

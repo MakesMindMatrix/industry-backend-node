@@ -1,0 +1,21 @@
+# Google App Engine - Industry Backend (Node.js)
+# Deploy: gcloud app deploy (from industry-backend-node)
+# Or run on GCE VM: clone repo, npm install, set .env, node server.js
+runtime: nodejs20
+env: standard
+service: default
+
+# Env vars set in App Engine console or via env_variables (no secrets here)
+# env_variables:
+#   NODE_ENV: production
+
+# Ensure enough memory for Node + PG
+instance_class: F2
+
+# Health check
+liveness_check:
+  path: /api/health
+  check_interval_sec: 30
+readiness_check:
+  path: /api/health
+  check_interval_sec: 10
