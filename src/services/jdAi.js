@@ -226,26 +226,30 @@ async function generateStudentCompetencyFromProfile(ai, student, jobSkillGroups)
  * Compute match score 0-100 between job skill groups and student skill groups.
  * Job has skills per category with weight; student has skills with level 1-5.
  * Score = weighted average of (student_level/5) over job skills.
+ * When AI returns empty skill groups, use default level 3 (60%) so we show a baseline score.
  */
 function computeMatchScore(jobSkillGroups, studentSkillGroups) {
   if (!Array.isArray(jobSkillGroups) || jobSkillGroups.length === 0) return 0;
+  const hasStudentData = Array.isArray(studentSkillGroups) && studentSkillGroups.length > 0;
+  const defaultLevel = hasStudentData ? 0 : 3; // 0 = no match when we have AI data; 3 = baseline when AI returned empty
   let totalWeight = 0;
   let weightedSum = 0;
   for (const jg of jobSkillGroups) {
     const jobSkills = Array.isArray(jg.skills) ? jg.skills : [];
     const weight = typeof jg.weight === 'number' ? jg.weight : 20;
-    const studentGroup = Array.isArray(studentSkillGroups)
+    const studentGroup = hasStudentData
       ? studentSkillGroups.find((sg) => (sg.category || '').toLowerCase() === (jg.category || '').toLowerCase())
       : null;
     const studentSkills = studentGroup && Array.isArray(studentGroup.skills) ? studentGroup.skills : [];
     for (const sk of jobSkills) {
-      const skillName = typeof sk === 'string' ? sk : (sk && sk.skill) || '';
+      const skillName = (typeof sk === 'string' ? sk : (sk && sk.skill) || '').trim().toLowerCase();
       if (!skillName) continue;
       totalWeight += weight;
-      const studentSk = studentSkills.find(
-        (ss) => (typeof ss.skill === 'string' ? ss.skill : '').toLowerCase() === skillName.toLowerCase()
-      );
-      const level = studentSk && typeof studentSk.level === 'number' ? studentSk.level : 0;
+      const studentSk = studentSkills.find((ss) => {
+        const s = (typeof ss.skill === 'string' ? ss.skill : (ss && ss.skill) || '').trim().toLowerCase();
+        return s === skillName;
+      });
+      const level = studentSk && typeof studentSk.level === 'number' ? studentSk.level : defaultLevel;
       weightedSum += weight * (level / 5);
     }
   }

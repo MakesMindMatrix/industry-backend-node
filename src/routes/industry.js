@@ -264,4 +264,251 @@ router.post('/contribute/interest', authMiddleware, async (req, res) => {
   }
 });
 
+// --- Talent Push (AI-matched students per company profile; cached, refresh manually or weekly) ---
+const talentPushAi = require('../services/talentPushAi');
+const { GoogleGenAI } = require('@google/genai');
+const { generateStudentCompetencyFromProfile, computeMatchScore } = require('../services/jdAi');
+const { getLearnersForOurStudents } = require('../services/fetchLearnersDirect');
+const { learnersByDocumentId } = require('../lib/strapiQuery');
+
+const EXTERNAL_LEARNERS_BASE = () => (process.env.EXTERNAL_LEARNERS_API_URL || 'https://api-dev.mindmatrix.io').replace(/\/$/, '');
+
+async function fetchLearnerByDocumentId(documentId) {
+  if (!documentId || typeof documentId !== 'string') return null;
+  const baseUrl = EXTERNAL_LEARNERS_BASE();
+  try {
+    const query = learnersByDocumentId(documentId, { populateUser: false });
+    const url = `${baseUrl}/api/learners?${query}`;
+    const response = await fetch(url, { headers: { Accept: 'application/json' } });
+    const data = await response.json().catch(() => ({}));
+    if (response.ok && Array.isArray(data.data) && data.data.length > 0) {
+      const raw = data.data[0];
+      const attrs = raw.attributes || raw;
+      return {
+        id: raw.id ?? attrs.id,
+        name: attrs.name,
+        education_level: attrs.education_level,
+        specialisation: attrs.specialisation,
+        user_category: attrs.user_category,
+        master_college: attrs.master_college?.data?.attributes ? { name: attrs.master_college.data.attributes.name } : attrs.master_college,
+        university: attrs.university?.data?.attributes ? { name: attrs.university.data.attributes.name } : attrs.university,
+        branch: attrs.branch?.data?.attributes ? { name: attrs.branch.data.attributes.name } : attrs.branch,
+        career_aspiration: attrs.career_aspiration?.data?.attributes ? { title: attrs.career_aspiration.data.attributes.title } : attrs.career_aspiration,
+        career_interests: attrs.career_interests?.data?.attributes ? { interests: (attrs.career_interests.data.attributes.interests || []).map((i) => ({ career_interest: i?.career_interest ?? i?.data?.attributes?.career_interest })) } : attrs.career_interests,
+        user: attrs.user?.data?.attributes ? { email: attrs.user.data.attributes.email, username: attrs.user.data.attributes.username } : attrs.user,
+      };
+    }
+  } catch (err) {
+    console.warn('[industry] fetchLearnerByDocumentId', documentId, err?.message);
+  }
+  return null;
+}
+
+// GET /api/industry/our-students — fetch learners directly (populate), random order (auth)
+router.get('/our-students', authMiddleware, async (req, res) => {
+  try {
+    const data = await getLearnersForOurStudents(500);
+    return res.json({ data });
+  } catch (err) {
+    console.error('[industry] our-students GET', err?.message);
+    return res.status(500).json({ data: [] });
+  }
+});
+
+// GET /api/industry/talent-push — return cached list (auth)
+router.get('/talent-push', authMiddleware, async (req, res) => {
+  try {
+    const cached = await talentPushAi.getCached(req.user.id);
+    return res.json({
+      students: cached.students,
+      computedAt: cached.computedAt,
+    });
+  } catch (err) {
+    console.error('[industry] talent-push GET', err);
+    return res.status(500).json({ students: [], computedAt: null });
+  }
+});
+
+// POST /api/industry/talent-push/refresh — recompute with AI and store (auth)
+router.post('/talent-push/refresh', authMiddleware, async (req, res) => {
+  try {
+    const result = await talentPushAi.computeAndSave(req.user.id);
+    return res.json({
+      students: result.students,
+      computedAt: result.computedAt,
+    });
+  } catch (err) {
+    console.error('[industry] talent-push/refresh', err);
+    return res.status(500).json({
+      error: { message: err.message || 'Failed to refresh talent push' },
+      students: [],
+      computedAt: null,
+    });
+  }
+});
+
+// Ensure talent_push_competency_cache exists (cache competency so we don't recompute on every view)
+async function ensureTalentPushCompetencyCacheTable() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS talent_push_competency_cache (
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      document_id VARCHAR(100) NOT NULL,
+      skill_groups JSONB DEFAULT '[]',
+      computed_at TIMESTAMPTZ DEFAULT NOW(),
+      PRIMARY KEY (user_id, document_id)
+    )
+  `);
+  await pool.query('CREATE INDEX IF NOT EXISTS idx_talent_push_competency_user ON talent_push_competency_cache(user_id)').catch(() => {});
+}
+
+// POST /api/industry/talent-push/student-competency — AI competency breakdown for a student; cached after first view (auth)
+router.post('/talent-push/student-competency', authMiddleware, async (req, res) => {
+  const apiKey = process.env.GEMINI_API_KEY?.trim();
+  const body = req.body || {};
+  const documentId = body.documentId ?? body.document_id;
+  const learnerSnapshot = body.learnerSnapshot ?? body.learner_snapshot ?? {};
+  if (!documentId && !(learnerSnapshot && typeof learnerSnapshot === 'object' && (learnerSnapshot.name || learnerSnapshot.id))) {
+    return res.status(400).json({ error: { message: 'documentId or learnerSnapshot with name/id required' }, skillGroups: [] });
+  }
+  const docIdForCache = documentId && typeof documentId === 'string' ? documentId.trim() : null;
+  try {
+    await ensureTalentPushCompetencyCacheTable();
+    if (docIdForCache) {
+      const cached = await pool.query(
+        'SELECT skill_groups FROM talent_push_competency_cache WHERE user_id = $1 AND document_id = $2',
+        [req.user.id, docIdForCache]
+      );
+      if (cached.rows[0] && Array.isArray(cached.rows[0].skill_groups) && cached.rows[0].skill_groups.length > 0) {
+        return res.json({ skillGroups: cached.rows[0].skill_groups });
+      }
+    }
+    if (!apiKey) {
+      return res.status(503).json({ error: { message: 'Gemini API key not configured' }, skillGroups: [] });
+    }
+    const profileRow = await pool.query(
+      'SELECT preferred_roles, preferred_skill_domains FROM industry_profiles WHERE user_id = $1',
+      [req.user.id]
+    );
+    const profile = profileRow.rows[0];
+    const roles = Array.isArray(profile?.preferred_roles) ? profile.preferred_roles.filter((r) => typeof r === 'string' && r.trim()) : [];
+    const domains = Array.isArray(profile?.preferred_skill_domains) ? profile.preferred_skill_domains.filter((d) => typeof d === 'string' && d.trim()) : [];
+    const jobSkillGroups = [];
+    if (roles.length > 0) {
+      jobSkillGroups.push({ category: 'Role alignment', skills: roles.slice(0, 8), weight: 50 });
+    }
+    if (domains.length > 0) {
+      jobSkillGroups.push({ category: 'Skill domains', skills: domains.slice(0, 8), weight: 50 });
+    }
+    if (jobSkillGroups.length === 0) {
+      jobSkillGroups.push(
+        { category: 'General readiness', skills: ['Technical aptitude', 'Communication', 'Learning agility', 'Problem solving'], weight: 100 }
+      );
+    }
+    let student = learnerSnapshot;
+    if (documentId && typeof documentId === 'string') {
+      const fetched = await fetchLearnerByDocumentId(documentId);
+      if (fetched) student = { ...fetched, documentId };
+      else student = { ...learnerSnapshot, documentId };
+    }
+    const ai = new GoogleGenAI({ apiKey });
+    const { skillGroups } = await generateStudentCompetencyFromProfile(ai, student, jobSkillGroups);
+    const groups = skillGroups || [];
+    if (docIdForCache && groups.length > 0) {
+      await pool.query(
+        `INSERT INTO talent_push_competency_cache (user_id, document_id, skill_groups, computed_at)
+         VALUES ($1, $2, $3::jsonb, NOW())
+         ON CONFLICT (user_id, document_id) DO UPDATE SET skill_groups = EXCLUDED.skill_groups, computed_at = NOW()`,
+        [req.user.id, docIdForCache, JSON.stringify(groups)]
+      );
+    }
+    return res.json({ skillGroups: groups });
+  } catch (err) {
+    console.error('[industry] talent-push/student-competency', err?.message || err);
+    return res.status(502).json({
+      error: { message: err.message || 'Failed to compute competency' },
+      skillGroups: [],
+    });
+  }
+});
+
+// Ensure talent_push_shortlist table exists
+async function ensureTalentPushShortlistTable() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS talent_push_shortlist (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      document_id VARCHAR(100) NOT NULL,
+      shortlisted BOOLEAN DEFAULT false,
+      shortlisted_at TIMESTAMPTZ,
+      schedule_requested BOOLEAN DEFAULT false,
+      schedule_requested_at TIMESTAMPTZ,
+      interview_date DATE,
+      interview_time VARCHAR(50),
+      interview_location VARCHAR(500),
+      interview_type VARCHAR(50),
+      learner_snapshot JSONB DEFAULT '{}',
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW(),
+      UNIQUE(user_id, document_id)
+    )
+  `);
+  await pool.query('CREATE INDEX IF NOT EXISTS idx_talent_push_shortlist_user ON talent_push_shortlist(user_id)').catch(() => {});
+}
+
+// POST /api/industry/talent-push/shortlist — add student to shortlist (shows under Active Hiring)
+router.post('/talent-push/shortlist', authMiddleware, async (req, res) => {
+  const documentId = req.body?.documentId ?? req.body?.document_id;
+  if (!documentId || typeof documentId !== 'string' || !documentId.trim()) {
+    return res.status(400).json({ error: { message: 'documentId is required' } });
+  }
+  try {
+    await ensureTalentPushShortlistTable();
+    const snapshot = req.body?.learnerSnapshot ?? req.body?.learner_snapshot ?? {};
+    await pool.query(
+      `INSERT INTO talent_push_shortlist (user_id, document_id, shortlisted, shortlisted_at, learner_snapshot, updated_at)
+       VALUES ($1, $2, true, NOW(), $3::jsonb, NOW())
+       ON CONFLICT (user_id, document_id) DO UPDATE SET
+         shortlisted = true, shortlisted_at = NOW(), learner_snapshot = COALESCE(EXCLUDED.learner_snapshot, talent_push_shortlist.learner_snapshot), updated_at = NOW()`,
+      [req.user.id, documentId.trim(), JSON.stringify(snapshot)]
+    );
+    return res.json({ ok: true, shortlisted: true });
+  } catch (err) {
+    console.error('[industry] talent-push/shortlist', err);
+    return res.status(500).json({ error: { message: err.message || 'Failed to shortlist' } });
+  }
+});
+
+// POST /api/industry/talent-push/schedule — mark schedule interview (shows under Active Hiring)
+router.post('/talent-push/schedule', authMiddleware, async (req, res) => {
+  const documentId = req.body?.documentId ?? req.body?.document_id;
+  if (!documentId || typeof documentId !== 'string' || !documentId.trim()) {
+    return res.status(400).json({ error: { message: 'documentId is required' } });
+  }
+  try {
+    await ensureTalentPushShortlistTable();
+    const interviewDate = req.body?.interview_date ?? req.body?.interviewDate ?? null;
+    const interviewTime = req.body?.interview_time ?? req.body?.interviewTime ?? null;
+    const interviewLocation = req.body?.interview_location ?? req.body?.interviewLocation ?? null;
+    const interviewType = req.body?.interview_type ?? req.body?.interviewType ?? null;
+    const snapshot = req.body?.learnerSnapshot ?? req.body?.learner_snapshot ?? {};
+    await pool.query(
+      `INSERT INTO talent_push_shortlist (user_id, document_id, schedule_requested, schedule_requested_at, interview_date, interview_time, interview_location, interview_type, learner_snapshot, updated_at)
+       VALUES ($1, $2, true, NOW(), $3, $4, $5, $6, $7::jsonb, NOW())
+       ON CONFLICT (user_id, document_id) DO UPDATE SET
+         schedule_requested = true, schedule_requested_at = NOW(),
+         interview_date = COALESCE(EXCLUDED.interview_date, talent_push_shortlist.interview_date),
+         interview_time = COALESCE(EXCLUDED.interview_time, talent_push_shortlist.interview_time),
+         interview_location = COALESCE(EXCLUDED.interview_location, talent_push_shortlist.interview_location),
+         interview_type = COALESCE(EXCLUDED.interview_type, talent_push_shortlist.interview_type),
+         learner_snapshot = COALESCE(NULLIF(EXCLUDED.learner_snapshot::text, '{}'), talent_push_shortlist.learner_snapshot),
+         updated_at = NOW()`,
+      [req.user.id, documentId.trim(), interviewDate, interviewTime, interviewLocation, interviewType, JSON.stringify(snapshot)]
+    );
+    return res.json({ ok: true, scheduled: true });
+  } catch (err) {
+    console.error('[industry] talent-push/schedule', err);
+    return res.status(500).json({ error: { message: err.message || 'Failed to schedule' } });
+  }
+});
+
 module.exports = router;

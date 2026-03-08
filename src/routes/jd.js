@@ -17,31 +17,48 @@ const {
   generateCompetencyFromJd,
   generateStudentCompetencyFromProfile,
   computeMatchScore,
-  shuffleArray,
 } = require('../services/jdAi');
-const { loadDocumentIdsFromCsv } = require('../services/studentCsv');
+const { getLearnersForMatch, getLearnersForOurStudents } = require('../services/fetchLearnersDirect');
+const { learnersByDocumentId } = require('../lib/strapiQuery');
+const { ensureFilterOptionsTable, syncFilterOptionsFromStrapi } = require('../services/filterOptionsSync');
 
 const TOP_MATCHES_COUNT = 10;
 
-/** Prefer document_id from student_ids table (admin-loaded CSV), else temp/student.csv. */
-async function getDocumentIdsForMatch() {
-  try {
-    const r = await pool.query(
-      `SELECT document_id FROM student_ids WHERE document_id IS NOT NULL AND document_id != '' ORDER BY id DESC LIMIT 20`
+// Parallel AI calls: process N students at a time (default 4). Higher = faster but may hit rate limits.
+const MATCH_CONCURRENCY = Math.max(1, Math.min(10, parseInt(process.env.MATCH_AI_CONCURRENCY, 10) || 4));
+
+/** Process students in parallel with concurrency limit. Returns [{ student, docId, studentSkillGroups, matchScore }]. */
+async function scoreStudentsInParallel(ai, list, jobSkillGroups) {
+  const results = [];
+  for (let i = 0; i < list.length; i += MATCH_CONCURRENCY) {
+    const chunk = list.slice(i, i + MATCH_CONCURRENCY);
+    const chunkResults = await Promise.all(
+      chunk.map(async (student) => {
+        try {
+          const { skillGroups: studentSkillGroups } = await generateStudentCompetencyFromProfile(ai, student, jobSkillGroups);
+          const matchScore = computeMatchScore(jobSkillGroups, studentSkillGroups);
+          const docId = student.documentId != null ? String(student.documentId) : (student.id != null ? String(student.id) : null);
+          return { student, docId, studentSkillGroups, matchScore };
+        } catch (err) {
+          console.warn('match-learners student failed', student?.id, err?.message);
+          return { student, docId: student.documentId ?? student.id, studentSkillGroups: [], matchScore: 0 };
+        }
+      })
     );
-    if (r.rows.length > 0) return r.rows.map((row) => row.document_id).filter(Boolean);
-  } catch (_) {}
-  return loadDocumentIdsFromCsv();
+    results.push(...chunkResults);
+  }
+  return results.filter((r) => r.docId);
 }
-const MIN_MATCH_SCORE = 80;
+
+// Minimum raw match score (0–100) required to keep a student in AI results.
+// Lowered to 50 during testing so Talent Discovery shows more candidates.
+const MIN_MATCH_SCORE = 50;
 const EXTERNAL_LEARNERS_BASE = () => process.env.EXTERNAL_LEARNERS_API_URL || 'https://api-dev.mindmatrix.io';
 
-// Display match % so it's always above 70: 50–60 add 20, below 50 add 40; floor 70, cap 95
+// Return match score for display (raw 0–100, no artificial inflation)
 function displayMatchPercent(score) {
   if (typeof score !== 'number') return null;
-  const add = score >= 50 ? 20 : 40;
-  const displayed = Math.round(score + add);
-  return Math.min(95, Math.max(70, displayed));
+  return Math.min(100, Math.max(0, Math.round(score)));
 }
 
 // Normalize learner from external API (Strapi v4 may use attributes or nested relation objects)
@@ -70,8 +87,8 @@ function normalizeLearnerFromApi(raw) {
   };
 }
 
-function buildLearnerSnapshot(student) {
-  return {
+function buildLearnerSnapshot(student, matchScore) {
+  const snap = {
     id: student.id,
     documentId: student.documentId,
     name: student.name,
@@ -85,6 +102,8 @@ function buildLearnerSnapshot(student) {
     career_interests: student.career_interests,
     user: student.user,
   };
+  if (typeof matchScore === 'number') snap.matchScore = matchScore;
+  return snap;
 }
 
 async function resolveCompetencyMatrixId(req, body) {
@@ -106,6 +125,66 @@ async function ensureMatrixOwnership(userId, competencyMatrixId) {
     [competencyMatrixId, userId]
   );
   return !!check.rows[0];
+}
+
+// GET /api/jd/filter-options — colleges, branches, specialisations, universities for dropdowns (synced from Strapi, stored in DB)
+router.get('/filter-options', async (req, res) => {
+  try {
+    await ensureFilterOptionsTable();
+    const r = await pool.query('SELECT type, value FROM filter_options ORDER BY type, value');
+    const colleges = [];
+    const branches = [];
+    const specialisations = [];
+    const universities = [];
+    for (const row of r.rows) {
+      const v = row.value ? String(row.value).trim() : '';
+      if (!v) continue;
+      if (row.type === 'college') colleges.push(v);
+      else if (row.type === 'branch') branches.push(v);
+      else if (row.type === 'specialisation') specialisations.push(v);
+      else if (row.type === 'university') universities.push(v);
+    }
+    if (colleges.length === 0 && branches.length === 0 && specialisations.length === 0 && universities.length === 0) {
+      await syncFilterOptionsFromStrapi();
+      const r2 = await pool.query('SELECT type, value FROM filter_options ORDER BY type, value');
+      for (const row of r2.rows) {
+        const v = row.value ? String(row.value).trim() : '';
+        if (!v) continue;
+        if (row.type === 'college') colleges.push(v);
+        else if (row.type === 'branch') branches.push(v);
+        else if (row.type === 'specialisation') specialisations.push(v);
+        else if (row.type === 'university') universities.push(v);
+      }
+    }
+    return res.json({ colleges, branches, specialisations, universities });
+  } catch (err) {
+    console.error('[jd] filter-options', err?.message);
+    return res.status(500).json({ colleges: [], branches: [], specialisations: [], universities: [] });
+  }
+});
+
+function applyFiltersToLearnerList(list, filters) {
+  if (!filters || typeof filters !== 'object') return list;
+  const education = filters.education_level ? String(filters.education_level).trim() : '';
+  const college = filters.college ? String(filters.college).trim() : '';
+  const branch = filters.branch ? String(filters.branch).trim() : '';
+  const specialisation = filters.specialisation ? String(filters.specialisation).trim() : '';
+  const university = filters.university ? String(filters.university).trim() : '';
+  if (!education && !college && !branch && !specialisation && !university) return list;
+  return list.filter((item) => {
+    const attrs = item.attributes || item;
+    const collegeName = (attrs.master_college?.name ?? attrs.master_college?.data?.attributes?.name ?? '').trim();
+    const branchName = (attrs.branch?.name ?? attrs.branch?.data?.attributes?.name ?? attrs.branch?.name ?? '').trim();
+    const uniName = (attrs.university?.name ?? attrs.university?.data?.attributes?.name ?? '').trim();
+    const spec = (attrs.specialisation ?? '').trim();
+    const edu = (attrs.education_level ?? '').trim();
+    if (education && edu !== education) return false;
+    if (college && !collegeName.toLowerCase().includes(college.toLowerCase())) return false;
+    if (branch && !branchName.toLowerCase().includes(branch.toLowerCase())) return false;
+    if (specialisation && spec.toLowerCase() !== specialisation.toLowerCase()) return false;
+    if (university && !uniName.toLowerCase().includes(university.toLowerCase())) return false;
+    return true;
+  });
 }
 
 // GET /api/jd/suggestions
@@ -341,8 +420,7 @@ router.post('/competency-from-jd', async (req, res) => {
 });
 
 // POST /api/jd/match-learners
-// Optional: body.competencyMatrixId or body.jdId to save results (requires auth). body.competencies for AI matching.
-// Temp: if temp/student.csv exists, loads up to 20 documentIds and fetches learners by documentId (populate=*); returns top 10 matches.
+// Fetch learners directly (populate), random selection. vacancies=1 → 5 learners to AI. body.competencyMatrixId or body.jdId to save (auth).
 router.post('/match-learners', optionalAuthMiddleware, async (req, res) => {
   const body = req.body || {};
   const competencies = body.competencies;
@@ -354,57 +432,29 @@ router.post('/match-learners', optionalAuthMiddleware, async (req, res) => {
       }))
     : [];
   const useAiMatching = jobSkillGroups.length > 0 && !!process.env.GEMINI_API_KEY?.trim();
-  const baseUrl = EXTERNAL_LEARNERS_BASE();
+  const vacancies = Math.max(1, parseInt(body.vacancies, 10) || 1);
 
   let list = [];
-  const csvDocumentIds = await getDocumentIdsForMatch();
 
-  if (useAiMatching && csvDocumentIds.length > 0) {
-    // Temp: fetch learners by documentId (one request per id), then AI match and return top 10
-    for (const docId of csvDocumentIds) {
-      try {
-        const url = `${baseUrl}/api/learners?filters[documentId][$eq]=${encodeURIComponent(docId)}&populate=*`;
-        const response = await fetch(url, { headers: { Accept: 'application/json' } });
-        const data = await response.json().catch(() => ({}));
-        if (response.ok && Array.isArray(data.data) && data.data.length > 0) {
-          list.push(data.data[0]);
-        }
-      } catch (err) {
-        console.warn('match-learners fetch by documentId failed', docId, err?.message);
-      }
-    }
-  }
-
-  if (!useAiMatching) {
+  if (useAiMatching) {
+    list = await getLearnersForMatch(vacancies);
+  } else {
+    const all = await getLearnersForOurStudents(300);
     const page = Math.max(1, parseInt(body.page, 10) || 1);
     const pageSize = Math.min(100, Math.max(1, parseInt(body.pageSize, 10) || 50));
-    const qs = `populate=*&pagination[page]=${page}&pagination[pageSize]=${pageSize}`;
-    const url = `${baseUrl}/api/learners?${qs}`;
-    try {
-      const response = await fetch(url, { headers: { Accept: 'application/json' } });
-      const data = await response.json().catch(() => ({}));
-      if (!response.ok) return res.status(response.status).json(data);
-      list = Array.isArray(data.data) ? data.data : [];
-      return res.json({
-        data: list,
-        meta: { pagination: { total: data.meta?.pagination?.total ?? list.length, page, pageSize, pageCount: data.meta?.pagination?.pageCount ?? 1 } },
-        suggestedFilters: { branchNames: [], careerAspirationTitles: [], specialisations: [], careerInterests: [] },
-      });
-    } catch (err) {
-      return res.status(502).json({ error: 'Failed to fetch learners', message: err?.message || 'External API unreachable' });
-    }
+    const start = (page - 1) * pageSize;
+    list = all.slice(start, start + pageSize);
+    return res.json({
+      data: list,
+      meta: { pagination: { total: all.length, page, pageSize, pageCount: Math.ceil(all.length / pageSize) || 1 } },
+      suggestedFilters: { branchNames: [], careerAspirationTitles: [], specialisations: [], careerInterests: [] },
+    });
   }
 
-  if (list.length === 0 && csvDocumentIds.length === 0) {
-    const page = Math.max(1, parseInt(body.page, 10) || 1);
-    const pageSize = Math.min(100, Math.max(50, 100));
-    const url = `${baseUrl}/api/learners?populate=*&pagination[page]=${page}&pagination[pageSize]=${pageSize}`;
-    try {
-      const response = await fetch(url, { headers: { Accept: 'application/json' } });
-      const data = await response.json().catch(() => ({}));
-      if (response.ok && Array.isArray(data.data)) list = shuffleArray(data.data).slice(0, 20);
-    } catch (_) {}
-  }
+  list = applyFiltersToLearnerList(list, body.filters);
+  const aiInputLimit = vacancies * 10;  // Send n*10 random students to AI
+  const displayLimit = vacancies * 5;    // Display top n*5
+  list = list.slice(0, aiInputLimit);
 
   if (list.length === 0) {
     return res.json({
@@ -415,43 +465,30 @@ router.post('/match-learners', optionalAuthMiddleware, async (req, res) => {
   }
 
   const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-  const results = [];
-  for (const student of list) {
-    try {
-      const { skillGroups: studentSkillGroups } = await generateStudentCompetencyFromProfile(ai, student, jobSkillGroups);
-      const matchScore = computeMatchScore(jobSkillGroups, studentSkillGroups);
-      const docId = student.documentId != null ? String(student.documentId) : (student.id != null ? String(student.id) : null);
-      results.push({
-        ...student,
-        studentCompetencyMatrix: studentSkillGroups,
-        matchScore,
-        documentId: docId,
-      });
-    } catch (err) {
-      console.warn('match-learners student competency failed', student?.id, err?.message);
-      results.push({
-        ...student,
-        studentCompetencyMatrix: [],
-        matchScore: 0,
-        documentId: (student.documentId != null ? String(student.documentId) : (student.id != null ? String(student.id) : null)),
-      });
-    }
-  }
+  const scored = await scoreStudentsInParallel(ai, list, jobSkillGroups);
+  const results = scored.map(({ student, docId, studentSkillGroups, matchScore }) => ({
+    ...student,
+    studentCompetencyMatrix: studentSkillGroups,
+    matchScore,
+    documentId: docId,
+  }));
   results.sort((a, b) => (b.matchScore ?? 0) - (a.matchScore ?? 0));
-  const onlyAboveMin = results.filter((r) => (r.matchScore ?? 0) >= MIN_MATCH_SCORE);
-  const topResults = onlyAboveMin.slice(0, TOP_MATCHES_COUNT);
+  // Take top n*5 regardless of score so we always show n*5 students (best available)
+  const topResults = results.slice(0, displayLimit);
 
   // Save to DB: attach to JD via competency_matrix (when auth + competencyMatrixId or jdId)
   const competencyMatrixId = await resolveCompetencyMatrixId(req, body);
   if (req.user && competencyMatrixId && (await ensureMatrixOwnership(req.user.id, competencyMatrixId))) {
     try {
       await pool.query(`ALTER TABLE competency_matrix_student_results ADD COLUMN IF NOT EXISTS learner_snapshot JSONB DEFAULT '{}'`);
+      await pool.query(`ALTER TABLE competency_matrices ADD COLUMN IF NOT EXISTS vacancies INTEGER DEFAULT 1`);
+      await pool.query(`UPDATE competency_matrices SET vacancies = $1 WHERE id = $2`, [vacancies, competencyMatrixId]);
     } catch (_) {}
     for (const r of topResults) {
       const studentDocId = r.documentId ?? (r.id != null ? String(r.id) : null);
       if (!studentDocId) continue;
       const compJson = JSON.stringify(Array.isArray(r.studentCompetencyMatrix) ? r.studentCompetencyMatrix : []);
-      const snapshot = JSON.stringify(buildLearnerSnapshot(r));
+      const snapshot = JSON.stringify(buildLearnerSnapshot(r, r.matchScore));
       await pool.query(
         `INSERT INTO competency_matrix_student_results (competency_matrix_id, student_document_id, match_score, student_competency_json, learner_snapshot)
          VALUES ($1, $2, $3, $4::jsonb, $5::jsonb)
@@ -492,29 +529,11 @@ router.post('/match-learners-stream', authMiddleware, async (req, res) => {
     return res.status(400).json({ error: 'competencies and GEMINI_API_KEY required' });
   }
 
-  const baseUrl = EXTERNAL_LEARNERS_BASE();
-  const csvDocumentIds = await getDocumentIdsForMatch();
-  let list = [];
-  if (csvDocumentIds.length > 0) {
-    for (const docId of csvDocumentIds) {
-      try {
-        const url = `${baseUrl}/api/learners?filters[documentId][$eq]=${encodeURIComponent(docId)}&populate=*`;
-        const response = await fetch(url, { headers: { Accept: 'application/json' } });
-        const data = await response.json().catch(() => ({}));
-        if (response.ok && Array.isArray(data.data) && data.data.length > 0) list.push(data.data[0]);
-      } catch (err) {
-        console.warn('match-learners-stream fetch failed', docId, err?.message);
-      }
-    }
-  }
-  if (list.length === 0) {
-    try {
-      const url = `${baseUrl}/api/learners?populate=*&pagination[page]=1&pagination[pageSize]=50`;
-      const response = await fetch(url, { headers: { Accept: 'application/json' } });
-      const data = await response.json().catch(() => ({}));
-      if (response.ok && Array.isArray(data.data)) list = shuffleArray(data.data).slice(0, 20);
-    } catch (_) {}
-  }
+  const vacancies = Math.max(1, parseInt(body.vacancies, 10) || 1);
+  const displayLimit = vacancies * 5;
+  let list = await getLearnersForMatch(vacancies);
+  list = applyFiltersToLearnerList(list, body.filters);
+  list = list.slice(0, vacancies * 10);  // Send n*10 to AI
 
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
@@ -531,31 +550,28 @@ router.post('/match-learners-stream', authMiddleware, async (req, res) => {
   (async () => {
     try {
       await pool.query(`ALTER TABLE competency_matrix_student_results ADD COLUMN IF NOT EXISTS learner_snapshot JSONB DEFAULT '{}'`).catch(() => {});
-      for (const student of list) {
-        try {
-          const { skillGroups: studentSkillGroups } = await generateStudentCompetencyFromProfile(ai, student, jobSkillGroups);
-          const matchScore = computeMatchScore(jobSkillGroups, studentSkillGroups);
-          if (matchScore < MIN_MATCH_SCORE) continue;
-          const docId = student.documentId != null ? String(student.documentId) : (student.id != null ? String(student.id) : null);
-          if (!docId) continue;
-          const payload = {
-            ...student,
-            documentId: docId,
-            studentCompetencyMatrix: studentSkillGroups,
-            matchScore: displayMatchPercent(matchScore) ?? matchScore,
-          };
-          const compJson = JSON.stringify(studentSkillGroups);
-          const snapshot = JSON.stringify(buildLearnerSnapshot({ ...student, documentId: docId }));
-          await pool.query(
-            `INSERT INTO competency_matrix_student_results (competency_matrix_id, student_document_id, match_score, student_competency_json, learner_snapshot)
-             VALUES ($1, $2, $3, $4::jsonb, $5::jsonb)
-             ON CONFLICT (competency_matrix_id, student_document_id) DO UPDATE SET match_score = EXCLUDED.match_score, student_competency_json = EXCLUDED.student_competency_json, learner_snapshot = EXCLUDED.learner_snapshot`,
-            [competencyMatrixId, docId, matchScore, compJson, snapshot]
-          );
-          send({ type: 'student', student: payload });
-        } catch (err) {
-          console.warn('match-learners-stream one failed', student?.id, err?.message);
-        }
+      await pool.query(`ALTER TABLE competency_matrices ADD COLUMN IF NOT EXISTS vacancies INTEGER DEFAULT 1`).catch(() => {});
+      await pool.query(`UPDATE competency_matrices SET vacancies = $1 WHERE id = $2`, [vacancies, competencyMatrixId]).catch(() => {});
+      await pool.query(`DELETE FROM competency_matrix_student_results WHERE competency_matrix_id = $1`, [competencyMatrixId]);
+      const scored = await scoreStudentsInParallel(ai, list, jobSkillGroups);
+      scored.sort((a, b) => (b.matchScore ?? 0) - (a.matchScore ?? 0));
+      const topScored = scored.slice(0, displayLimit);  // Top n*5 regardless of score
+      for (const { student, docId, studentSkillGroups, matchScore } of topScored) {
+        const payload = {
+          ...student,
+          documentId: docId,
+          studentCompetencyMatrix: studentSkillGroups,
+          matchScore: displayMatchPercent(matchScore) ?? matchScore,
+        };
+        const compJson = JSON.stringify(studentSkillGroups);
+        const snapshot = JSON.stringify(buildLearnerSnapshot({ ...student, documentId: docId }, matchScore));
+        await pool.query(
+          `INSERT INTO competency_matrix_student_results (competency_matrix_id, student_document_id, match_score, student_competency_json, learner_snapshot)
+           VALUES ($1, $2, $3, $4::jsonb, $5::jsonb)
+           ON CONFLICT (competency_matrix_id, student_document_id) DO UPDATE SET match_score = EXCLUDED.match_score, student_competency_json = EXCLUDED.student_competency_json, learner_snapshot = EXCLUDED.learner_snapshot`,
+          [competencyMatrixId, docId, matchScore, compJson, snapshot]
+        );
+        send({ type: 'student', student: payload });
       }
       send({ type: 'done' });
     } catch (err) {
@@ -583,26 +599,33 @@ router.get('/match-results', authMiddleware, async (req, res) => {
   if (!allowed) return res.status(404).json({ error: 'Not found' });
   try {
     await pool.query(`ALTER TABLE competency_matrix_student_results ADD COLUMN IF NOT EXISTS learner_snapshot JSONB DEFAULT '{}'`);
+    await pool.query(`ALTER TABLE competency_matrices ADD COLUMN IF NOT EXISTS vacancies INTEGER DEFAULT 1`);
     await pool.query(`ALTER TABLE competency_matrix_student_results ADD COLUMN IF NOT EXISTS interview_date DATE`);
     await pool.query(`ALTER TABLE competency_matrix_student_results ADD COLUMN IF NOT EXISTS interview_time VARCHAR(50)`);
     await pool.query(`ALTER TABLE competency_matrix_student_results ADD COLUMN IF NOT EXISTS interview_location VARCHAR(500)`);
     await pool.query(`ALTER TABLE competency_matrix_student_results ADD COLUMN IF NOT EXISTS interview_type VARCHAR(50)`);
   } catch (_) {}
+  const cmRow = await pool.query(
+    'SELECT COALESCE(vacancies, 1) AS vacancies FROM competency_matrices WHERE id = $1',
+    [matrixId]
+  );
+  const displayLimit = Math.max(5, (cmRow.rows[0]?.vacancies ?? 1) * 5);
   const r = await pool.query(
     `SELECT student_document_id, match_score, student_competency_json, learner_snapshot, shortlisted, schedule_requested,
       interview_date, interview_time, interview_location, interview_type
-     FROM competency_matrix_student_results WHERE competency_matrix_id = $1 ORDER BY match_score DESC`,
-    [matrixId]
+     FROM competency_matrix_student_results WHERE competency_matrix_id = $1 ORDER BY match_score DESC LIMIT $2`,
+    [matrixId, displayLimit]
   );
   const data = [];
   for (const row of r.rows) {
     const snapshot = row.learner_snapshot && typeof row.learner_snapshot === 'object' ? row.learner_snapshot : {};
-    const displayScore = displayMatchPercent(row.match_score);
+    const rawScore = row.match_score ?? snapshot.matchScore;
+    const displayScore = displayMatchPercent(rawScore);
     let item = {
       ...snapshot,
       documentId: row.student_document_id,
       id: snapshot.id || row.student_document_id,
-      matchScore: displayScore != null ? displayScore : row.match_score,
+      matchScore: displayScore != null ? displayScore : rawScore,
       studentCompetencyMatrix: row.student_competency_json || [],
       shortlisted: row.shortlisted,
       schedule_requested: row.schedule_requested,
@@ -671,7 +694,8 @@ async function fetchLearnerByDocumentId(documentId) {
   if (!documentId || typeof documentId !== 'string') return null;
   const baseUrl = EXTERNAL_LEARNERS_BASE();
   try {
-    const url = `${baseUrl}/api/learners?filters[documentId][$eq]=${encodeURIComponent(documentId)}&populate=*`;
+    const query = learnersByDocumentId(documentId, { populateUser: false });
+    const url = `${baseUrl}/api/learners?${query}`;
     const response = await fetch(url, { headers: { Accept: 'application/json' } });
     const data = await response.json().catch(() => ({}));
     if (response.ok && Array.isArray(data.data) && data.data.length > 0) {
@@ -738,6 +762,40 @@ router.get('/active-hiring', authMiddleware, async (req, res) => {
     }
     jdList.push({ jdId: jd.jd_id, jdTitle: jd.jd_title, shortlisted, scheduled });
   }
+  // Talent Push shortlist/schedule (from Events & Contributions > Talent Push)
+  try {
+    const tp = await pool.query(
+      `SELECT document_id, shortlisted, shortlisted_at, schedule_requested, schedule_requested_at, interview_date, interview_time, interview_location, interview_type, learner_snapshot
+       FROM talent_push_shortlist WHERE user_id = $1 AND (shortlisted = true OR schedule_requested = true)
+       ORDER BY schedule_requested_at DESC NULLS LAST, shortlisted_at DESC NULLS LAST`,
+      [req.user.id]
+    );
+    const tpShortlisted = [];
+    const tpScheduled = [];
+    for (const row of tp.rows) {
+      const snapshot = row.learner_snapshot && typeof row.learner_snapshot === 'object' ? row.learner_snapshot : {};
+      let item = {
+        ...snapshot,
+        documentId: row.document_id,
+        matchScore: snapshot.matchScore ?? snapshot.fitScore,
+        shortlisted: row.shortlisted,
+        schedule_requested: row.schedule_requested,
+        interview_date: row.interview_date,
+        interview_time: row.interview_time,
+        interview_location: row.interview_location,
+        interview_type: row.interview_type,
+      };
+      if (!item.name && row.document_id) {
+        const meta = await fetchLearnerByDocumentId(row.document_id);
+        if (meta) item = { ...meta, ...item };
+      }
+      if (row.shortlisted) tpShortlisted.push(item);
+      if (row.schedule_requested) tpScheduled.push(item);
+    }
+    if (tpShortlisted.length > 0 || tpScheduled.length > 0) {
+      jdList.push({ jdId: 0, jdTitle: 'Talent Push', shortlisted: tpShortlisted, scheduled: tpScheduled });
+    }
+  } catch (_) {}
   return res.json({ data: jdList });
 });
 
@@ -754,62 +812,44 @@ router.post('/match-learners-background', authMiddleware, async (req, res) => {
     : [];
   const competencyMatrixId = await resolveCompetencyMatrixId(req, body);
   if (!competencyMatrixId || !(await ensureMatrixOwnership(req.user.id, competencyMatrixId))) {
-    return res.status(400).json({ error: 'competencyMatrixId or jdId required' });
+    console.warn('[match-learners-background] 400: competencyMatrixId or jdId missing/ownership failed', { competencyMatrixId, hasBody: !!body, jdId: body.jdId });
+    return res.status(400).json({ error: 'competencyMatrixId or jdId required. Ensure you have selected a JD with competency matrix.' });
   }
-  if (jobSkillGroups.length === 0 || !process.env.GEMINI_API_KEY?.trim()) {
-    return res.status(400).json({ error: 'competencies and GEMINI_API_KEY required' });
+  if (jobSkillGroups.length === 0) {
+    console.warn('[match-learners-background] 400: competency matrix has no skill groups');
+    return res.status(400).json({ error: 'Competency matrix has no skill groups. Generate or approve competency from the JD first.' });
   }
-  const baseUrl = EXTERNAL_LEARNERS_BASE();
-  const csvDocumentIds = await getDocumentIdsForMatch();
-  let list = [];
-  if (csvDocumentIds.length > 0) {
-    for (const docId of csvDocumentIds) {
-      try {
-        const url = `${baseUrl}/api/learners?filters[documentId][$eq]=${encodeURIComponent(docId)}&populate=*`;
-        const response = await fetch(url, { headers: { Accept: 'application/json' } });
-        const data = await response.json().catch(() => ({}));
-        if (response.ok && Array.isArray(data.data) && data.data.length > 0) {
-          list.push(normalizeLearnerFromApi(data.data[0]));
-        }
-      } catch (err) {
-        console.warn('match-learners-background fetch failed', docId, err?.message);
-      }
-    }
+  if (!process.env.GEMINI_API_KEY?.trim()) {
+    return res.status(400).json({ error: 'GEMINI_API_KEY not configured. AI matching unavailable.' });
   }
-  if (list.length === 0) {
-    try {
-      const url = `${baseUrl}/api/learners?populate=*&pagination[page]=1&pagination[pageSize]=50`;
-      const response = await fetch(url, { headers: { Accept: 'application/json' } });
-      const data = await response.json().catch(() => ({}));
-      if (response.ok && Array.isArray(data.data)) {
-        list = shuffleArray(data.data).slice(0, 20).map(normalizeLearnerFromApi);
-      }
-    } catch (_) {}
-  }
+  const vacancies = Math.max(1, parseInt(body.vacancies, 10) || 1);
+  const displayLimit = vacancies * 5;
+  let list = await getLearnersForMatch(vacancies);
+  list = applyFiltersToLearnerList(list, body.filters);
+  list = list.slice(0, vacancies * 10);  // Send n*10 to AI
   const matrixId = competencyMatrixId;
+  console.log('[match-learners-background] matrixId=%d vacancies=%d learnersToScore=%d displayLimit=%d', matrixId, vacancies, list.length, displayLimit);
   setImmediate(async () => {
     const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
     try {
       await pool.query(`ALTER TABLE competency_matrix_student_results ADD COLUMN IF NOT EXISTS learner_snapshot JSONB DEFAULT '{}'`).catch(() => {});
-      for (const student of list) {
-        try {
-          const { skillGroups: studentSkillGroups } = await generateStudentCompetencyFromProfile(ai, student, jobSkillGroups);
-          const matchScore = computeMatchScore(jobSkillGroups, studentSkillGroups);
-          if (matchScore < MIN_MATCH_SCORE) continue;
-          const docId = student.documentId != null ? String(student.documentId) : (student.id != null ? String(student.id) : null);
-          if (!docId) continue;
-          const compJson = JSON.stringify(studentSkillGroups);
-          const forSnapshot = normalizeLearnerFromApi({ ...student, documentId: docId });
-          const snapshot = JSON.stringify(buildLearnerSnapshot(forSnapshot));
-          await pool.query(
-            `INSERT INTO competency_matrix_student_results (competency_matrix_id, student_document_id, match_score, student_competency_json, learner_snapshot)
-             VALUES ($1, $2, $3, $4::jsonb, $5::jsonb)
-             ON CONFLICT (competency_matrix_id, student_document_id) DO UPDATE SET match_score = EXCLUDED.match_score, student_competency_json = EXCLUDED.student_competency_json, learner_snapshot = EXCLUDED.learner_snapshot`,
-            [matrixId, docId, matchScore, compJson, snapshot]
-          );
-        } catch (err) {
-          console.warn('match-learners-background one failed', student?.id, err?.message);
-        }
+      await pool.query(`ALTER TABLE competency_matrices ADD COLUMN IF NOT EXISTS vacancies INTEGER DEFAULT 1`).catch(() => {});
+      await pool.query(`UPDATE competency_matrices SET vacancies = $1 WHERE id = $2`, [vacancies, matrixId]).catch(() => {});
+      await pool.query(`DELETE FROM competency_matrix_student_results WHERE competency_matrix_id = $1`, [matrixId]);
+      const scored = await scoreStudentsInParallel(ai, list, jobSkillGroups);
+      scored.sort((a, b) => (b.matchScore ?? 0) - (a.matchScore ?? 0));
+      const topScored = scored.slice(0, displayLimit);  // Top n*5 regardless of score
+      console.log('[match-learners-background] scored=%d topScored=%d', scored.length, topScored.length);
+      for (const { student, docId, studentSkillGroups, matchScore } of topScored) {
+        const compJson = JSON.stringify(studentSkillGroups);
+        const forSnapshot = normalizeLearnerFromApi({ ...student, documentId: docId });
+        const snapshot = JSON.stringify(buildLearnerSnapshot(forSnapshot, matchScore));
+        await pool.query(
+          `INSERT INTO competency_matrix_student_results (competency_matrix_id, student_document_id, match_score, student_competency_json, learner_snapshot)
+           VALUES ($1, $2, $3, $4::jsonb, $5::jsonb)
+           ON CONFLICT (competency_matrix_id, student_document_id) DO UPDATE SET match_score = EXCLUDED.match_score, student_competency_json = EXCLUDED.student_competency_json, learner_snapshot = EXCLUDED.learner_snapshot`,
+          [matrixId, docId, matchScore, compJson, snapshot]
+        );
       }
     } catch (err) {
       console.error('match-learners-background', err?.message);

@@ -39,9 +39,6 @@ app.use('/api/industry', industryRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/content', contentRoutes);
 
-const { loadStudentCsvOnStartup } = require('./src/scripts/loadStudentCsvOnStartup');
-
 app.listen(PORT, HOST, () => {
   console.log(`Industry backend (Node) running at http://${HOST}:${PORT}`);
-  loadStudentCsvOnStartup().catch((err) => console.warn('Student CSV sync on startup:', err?.message));
 });

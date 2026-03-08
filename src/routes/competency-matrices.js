@@ -12,13 +12,20 @@ function rowToCm(row) {
     job_description: row.job_description_id,
     skillGroups: row.skill_groups || [],
     approved: row.approved,
+    vacancies: row.vacancies != null ? row.vacancies : 1,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
 }
 
+// Ensure vacancies column exists (migration for existing DBs)
+async function ensureVacanciesColumn() {
+  await pool.query(`ALTER TABLE competency_matrices ADD COLUMN IF NOT EXISTS vacancies INTEGER DEFAULT 1`);
+}
+
 // GET /api/competency-matrices/by-jd/:jdId
 router.get('/by-jd/:jdId', async (req, res) => {
+  await ensureVacanciesColumn().catch(() => {});
   const jdId = parseInt(req.params.jdId, 10);
   if (Number.isNaN(jdId)) return res.status(400).json({ error: { message: 'Invalid JD id' } });
   const jdCheck = await pool.query(
@@ -35,7 +42,7 @@ router.get('/by-jd/:jdId', async (req, res) => {
     [jdId]
   );
   const row = r.rows[0];
-  if (!row) return res.status(404).json({ error: { message: 'Competency matrix not found' } });
+  if (!row) return res.status(404).json({ error: { message: 'Competency matrix not found for this JD. Generate one from the JD first.' } });
   return res.json(rowToCm(row));
 });
 
@@ -99,6 +106,11 @@ router.put('/:id', async (req, res) => {
   if (body.approved !== undefined) {
     updates.push(`approved = $${i++}`);
     values.push(!!body.approved);
+  }
+  if (body.vacancies !== undefined) {
+    const v = Math.max(1, Math.min(999, parseInt(body.vacancies, 10) || 1));
+    updates.push(`vacancies = $${i++}`);
+    values.push(v);
   }
   if (updates.length === 0) {
     return res.json(rowToCm(existing));

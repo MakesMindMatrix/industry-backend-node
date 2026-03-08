@@ -6,7 +6,7 @@ const fs = require('fs');
 const path = require('path');
 const { pool } = require('../db/pool');
 const { adminAuthMiddleware, ADMIN_JWT_SECRET } = require('../middleware/adminAuth');
-const { CSV_PATH } = require('../services/studentCsv');
+const { syncFilterOptionsFromStrapi } = require('../services/filterOptionsSync');
 
 // POST /api/admin/login — body: { email, password } or { identifier, password }
 router.post('/login', async (req, res) => {
@@ -220,6 +220,27 @@ router.delete('/contributions/:id', async (req, res) => {
   return res.json({ success: true });
 });
 
+// --- Filter options (Talent Discovery dropdowns: colleges, branches, specialisations, universities) ---
+// POST /api/admin/filter-options/sync — sync from Strapi learners into DB (admin only)
+router.post('/filter-options/sync', async (req, res) => {
+  try {
+    const counts = await syncFilterOptionsFromStrapi();
+    return res.json({
+      ok: true,
+      message: 'Filter values updated from Strapi learners.',
+      counts: {
+        colleges: counts.colleges,
+        branches: counts.branches,
+        specialisations: counts.specialisations,
+        universities: counts.universities,
+      },
+    });
+  } catch (err) {
+    console.error('[admin] filter-options/sync', err?.message);
+    return res.status(500).json({ error: { message: err?.message || 'Sync failed' } });
+  }
+});
+
 // --- Student IDs (CSV / admin CRUD) ---
 async function ensureStudentIdsTable() {
   await pool.query(`
@@ -235,6 +256,14 @@ async function ensureStudentIdsTable() {
   `);
   await pool.query('CREATE INDEX IF NOT EXISTS idx_student_ids_email ON student_ids(email)').catch(() => {});
   await pool.query('CREATE INDEX IF NOT EXISTS idx_student_ids_document_id ON student_ids(document_id)').catch(() => {});
+  await pool.query(`
+    DELETE FROM student_ids a USING student_ids b
+    WHERE a.document_id IS NOT NULL AND a.document_id != '' AND a.document_id = b.document_id AND a.id > b.id
+  `).catch(() => {});
+  await pool.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_student_ids_document_id_unique
+    ON student_ids(document_id) WHERE (document_id IS NOT NULL AND document_id != '')
+  `).catch(() => {});
 }
 
 function studentRowToJson(row) {
@@ -255,44 +284,6 @@ router.get('/students', async (req, res) => {
   await ensureStudentIdsTable();
   const r = await pool.query('SELECT * FROM student_ids ORDER BY id DESC');
   return res.json(r.rows.map(studentRowToJson));
-});
-
-// POST /api/admin/students/load-csv — load temp/student.csv into DB (replaces all rows with source='csv')
-router.post('/students/load-csv', async (req, res) => {
-  await ensureStudentIdsTable();
-  const fullPath = path.resolve(CSV_PATH);
-  if (!fs.existsSync(fullPath)) {
-    return res.status(404).json({ error: { message: 'File not found: temp/student.csv' } });
-  }
-  const content = fs.readFileSync(fullPath, 'utf8');
-  const lines = content.split(/\r?\n/).filter((line) => line.trim());
-  if (lines.length < 2) {
-    return res.json({ loaded: 0, message: 'CSV has no data rows' });
-  }
-  const header = lines[0].toLowerCase().split(',').map((c) => c.trim());
-  const emailIdx = header.indexOf('email');
-  const idIdx = header.indexOf('id');
-  const docIdIdx = header.indexOf('documentid');
-  if (emailIdx === -1) {
-    return res.status(400).json({ error: { message: 'CSV must have an email column' } });
-  }
-  await pool.query("DELETE FROM student_ids WHERE source = 'csv'");
-  let loaded = 0;
-  for (let i = 1; i < lines.length; i++) {
-    const parts = lines[i].split(',');
-    const email = (parts[emailIdx] || '').trim();
-    if (!email) continue;
-    const externalId = idIdx >= 0 && parts[idIdx] !== undefined && parts[idIdx].trim() !== ''
-      ? parseInt(parts[idIdx].trim(), 10) : null;
-    let docId = docIdIdx >= 0 && parts[docIdIdx] !== undefined ? parts[docIdIdx].trim() : null;
-    if (docId === 'NOT_FOUND' || docId === '') docId = null;
-    await pool.query(
-      `INSERT INTO student_ids (email, external_id, document_id, source) VALUES ($1, $2, $3, 'csv')`,
-      [email, Number.isNaN(externalId) ? null : externalId, docId]
-    );
-    loaded += 1;
-  }
-  return res.json({ loaded, message: `Loaded ${loaded} rows from temp/student.csv` });
 });
 
 // POST /api/admin/students/upload — parse CSV from body and insert (body: { csv: "..." })
@@ -322,13 +313,22 @@ router.post('/students/upload', async (req, res) => {
       ? parseInt(parts[idIdx].trim(), 10) : null;
     let docId = docIdIdx >= 0 && parts[docIdIdx] !== undefined ? parts[docIdIdx].trim() : null;
     if (docId === 'NOT_FOUND' || docId === '') docId = null;
-    await pool.query(
-      `INSERT INTO student_ids (email, external_id, document_id, source) VALUES ($1, $2, $3, 'upload')`,
-      [email, Number.isNaN(externalId) ? null : externalId, docId]
-    );
+    if (docId) {
+      await pool.query(
+        `INSERT INTO student_ids (email, external_id, document_id, source) VALUES ($1, $2, $3, 'upload')
+         ON CONFLICT (document_id) WHERE (document_id IS NOT NULL AND document_id != '') DO UPDATE SET
+           email = EXCLUDED.email, external_id = EXCLUDED.external_id, source = EXCLUDED.source, updated_at = NOW()`,
+        [email, Number.isNaN(externalId) ? null : externalId, docId]
+      );
+    } else {
+      await pool.query(
+        `INSERT INTO student_ids (email, external_id, document_id, source) VALUES ($1, $2, $3, 'upload')`,
+        [email, Number.isNaN(externalId) ? null : externalId, docId]
+      );
+    }
     loaded += 1;
   }
-  return res.json({ loaded, message: `Inserted ${loaded} rows` });
+  return res.json({ loaded, message: `Inserted ${loaded} rows (unique document_id)` });
 });
 
 // GET /api/admin/students/:id
@@ -338,7 +338,7 @@ router.get('/students/:id', async (req, res) => {
   return res.json(studentRowToJson(r.rows[0]));
 });
 
-// POST /api/admin/students — create one
+// POST /api/admin/students — create one (upserts by document_id if provided)
 router.post('/students', async (req, res) => {
   await ensureStudentIdsTable();
   const { email, external_id, document_id } = req.body || {};
@@ -348,11 +348,22 @@ router.post('/students', async (req, res) => {
   const extId = external_id !== undefined && external_id !== '' && external_id !== null
     ? parseInt(String(external_id), 10) : null;
   const docId = document_id !== undefined && document_id !== null ? String(document_id).trim() || null : null;
-  const r = await pool.query(
-    `INSERT INTO student_ids (email, external_id, document_id, source) VALUES ($1, $2, $3, 'manual')
-     RETURNING *`,
-    [email.trim(), Number.isNaN(extId) ? null : extId, docId]
-  );
+  let r;
+  if (docId) {
+    r = await pool.query(
+      `INSERT INTO student_ids (email, external_id, document_id, source) VALUES ($1, $2, $3, 'manual')
+       ON CONFLICT (document_id) WHERE (document_id IS NOT NULL AND document_id != '') DO UPDATE SET
+         email = EXCLUDED.email, external_id = EXCLUDED.external_id, updated_at = NOW()
+       RETURNING *`,
+      [email.trim(), Number.isNaN(extId) ? null : extId, docId]
+    );
+  } else {
+    r = await pool.query(
+      `INSERT INTO student_ids (email, external_id, document_id, source) VALUES ($1, $2, $3, 'manual')
+       RETURNING *`,
+      [email.trim(), Number.isNaN(extId) ? null : extId, docId]
+    );
+  }
   return res.status(201).json(studentRowToJson(r.rows[0]));
 });
 

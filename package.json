@@ -10,8 +10,11 @@
     "seed-admin": "node scripts/seed-admin.js",
     "seed-industry": "node scripts/seed-industry-user.js"
   },
-  "engines": { "node": ">=18.0.0" },
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "dependencies": {
+    "@google/genai": "^1.0.0",
     "bcryptjs": "^2.4.3",
     "cors": "^2.8.5",
     "dotenv": "^16.3.1",
@@ -19,6 +22,6 @@
     "jsonwebtoken": "^9.0.2",
     "pg": "^8.11.3",
     "pgvector": "^0.2.0",
-    "@google/genai": "^1.0.0"
+    "qs": "^6.15.0"
   }
 }

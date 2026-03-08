@@ -57,6 +57,7 @@ CREATE TABLE IF NOT EXISTS competency_matrices (
   job_description_id INTEGER NOT NULL REFERENCES job_descriptions(id) ON DELETE CASCADE,
   skill_groups JSONB DEFAULT '[]',
   approved BOOLEAN DEFAULT false,
+  vacancies INTEGER DEFAULT 1,
   created_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
@@ -172,6 +173,7 @@ CREATE INDEX IF NOT EXISTS idx_cm_student_results_matrix ON competency_matrix_st
 CREATE INDEX IF NOT EXISTS idx_cm_student_results_document_id ON competency_matrix_student_results(student_document_id);
 
 -- Student IDs (from CSV / admin upload); used for match-learners when present
+-- document_id is unique (one row per document); multiple rows with NULL document_id are allowed
 CREATE TABLE IF NOT EXISTS student_ids (
   id SERIAL PRIMARY KEY,
   email VARCHAR(255) NOT NULL,
@@ -183,3 +185,52 @@ CREATE TABLE IF NOT EXISTS student_ids (
 );
 CREATE INDEX IF NOT EXISTS idx_student_ids_email ON student_ids(email);
 CREATE INDEX IF NOT EXISTS idx_student_ids_document_id ON student_ids(document_id);
+-- Enforce one row per document_id (NULLs allowed for multiple rows)
+CREATE UNIQUE INDEX IF NOT EXISTS idx_student_ids_document_id_unique ON student_ids(document_id) WHERE (document_id IS NOT NULL AND document_id != '');
+
+-- Talent Push: AI-matched students per company (cached; refresh manually or weekly)
+CREATE TABLE IF NOT EXISTS talent_push_cache (
+  user_id INTEGER NOT NULL PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  results JSONB DEFAULT '[]',
+  computed_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Talent Push shortlist / schedule: students chosen from Talent Push; shown under Active Hiring
+CREATE TABLE IF NOT EXISTS talent_push_shortlist (
+  id SERIAL PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  document_id VARCHAR(100) NOT NULL,
+  shortlisted BOOLEAN DEFAULT false,
+  shortlisted_at TIMESTAMPTZ,
+  schedule_requested BOOLEAN DEFAULT false,
+  schedule_requested_at TIMESTAMPTZ,
+  interview_date DATE,
+  interview_time VARCHAR(50),
+  interview_location VARCHAR(500),
+  interview_type VARCHAR(50),
+  learner_snapshot JSONB DEFAULT '{}',
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE(user_id, document_id)
+);
+CREATE INDEX IF NOT EXISTS idx_talent_push_shortlist_user ON talent_push_shortlist(user_id);
+
+-- Talent Push: cached competency breakdown per student (avoid recomputing on every view)
+CREATE TABLE IF NOT EXISTS talent_push_competency_cache (
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  document_id VARCHAR(100) NOT NULL,
+  skill_groups JSONB DEFAULT '[]',
+  computed_at TIMESTAMPTZ DEFAULT NOW(),
+  PRIMARY KEY (user_id, document_id)
+);
+CREATE INDEX IF NOT EXISTS idx_talent_push_competency_user ON talent_push_competency_cache(user_id);
+
+-- Filter dropdown options (colleges, branches, specialisations, universities) synced from Strapi learners
+CREATE TABLE IF NOT EXISTS filter_options (
+  id SERIAL PRIMARY KEY,
+  type VARCHAR(50) NOT NULL,
+  value VARCHAR(500) NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE(type, value)
+);
+CREATE INDEX IF NOT EXISTS idx_filter_options_type ON filter_options(type);
