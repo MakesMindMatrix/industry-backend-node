@@ -7,6 +7,7 @@
     "start": "node server.js",
     "dev": "node server.js",
     "init-db": "node scripts/init-db.js",
+    "migrate-db": "node scripts/migrate-db.js",
     "seed-admin": "node scripts/seed-admin.js",
     "seed-industry": "node scripts/seed-industry-user.js"
   },
